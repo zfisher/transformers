@@ -24,6 +24,10 @@ import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 
+import torch.utils
+import torch.utils.checkpoint
+
+
 from .activations import gelu_new
 from .configuration_gpt2 import GPT2Config
 from .file_utils import add_start_docstrings, add_start_docstrings_to_callable
@@ -194,6 +198,7 @@ class Attention(nn.Module):
         a = self.resid_dropout(a)
 
         outputs = [a, present] + attn_outputs[1:]
+
         return outputs  # a, present, (attentions)
 
 
@@ -231,8 +236,9 @@ class Block(nn.Module):
         m = self.mlp(self.ln_2(x))
         x = x + m
 
-        outputs = [x] + output_attn[1:]
-        return outputs  # x, present, (attentions)
+        return x, output_attn[1]
+        # outputs = [x] + output_attn[1:]
+        # return outputs  # x, present, (attentions)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -276,17 +282,14 @@ GPT2_START_DOCSTRING = r"""
 
 GPT2_INPUTS_DOCSTRING = r"""
     Args:
-        input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length if `past` is None else 1
+        input_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary.
-            If using `past` as an input make sure that `input_ids` are those of the last position.
 
             Indices can be obtained using :class:`transformers.GPT2Tokenizer`.
             See :func:`transformers.PreTrainedTokenizer.encode` and
             :func:`transformers.PreTrainedTokenizer.encode_plus` for details.
 
             `What are input IDs? <../glossary.html#input-ids>`__
-
         past (:obj:`List[torch.FloatTensor]` of length :obj:`config.n_layers`):
             Contains pre-computed hidden-states (key and values in the attention blocks) as computed by the model
             (see `past` output below). Can be used to speed up sequential decoding. The token ids which have their past given to this model
@@ -297,12 +300,10 @@ GPT2_INPUTS_DOCSTRING = r"""
             ``1`` for tokens that are NOT MASKED, ``0`` for MASKED tokens.
 
             `What are attention masks? <../glossary.html#attention-mask>`__
-        token_type_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, input_ids_length)`, `optional`, defaults to :obj:`None`):
-            `input_ids_length` = `sequence_length if `past` is None else 1
+        token_type_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
             Segment token indices to indicate first and second portions of the inputs.
             Indices are selected in ``[0, 1]``: ``0`` corresponds to a `sentence A` token, ``1``
             corresponds to a `sentence B` token
-            If using `past` as an input make sure that `token_type_ids` correspond to the `input_ids` of the last position.
 
             `What are token type IDs? <../glossary.html#token-type-ids>`_
         position_ids (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`, defaults to :obj:`None`):
@@ -424,8 +425,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         # Attention mask.
         if attention_mask is not None:
-            batch_size = input_ids.shape[0]
-            attention_mask = attention_mask.view(batch_size, -1)
+            attention_mask = attention_mask.view(-1, input_shape[-1])
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
             # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
@@ -460,10 +460,15 @@ class GPT2Model(GPT2PreTrainedModel):
             head_mask = [None] * self.config.n_layer
 
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
+
+            inputs_embeds = torch.utils.checkpoint.checkpoint(self.wte, input_ids)
+            # inputs_embeds = self.wte(input_ids)
+
+        # position_embeds = self.wpe(position_ids)
+        position_embeds = torch.utils.checkpoint.checkpoint(self.wpe, position_ids)
         if token_type_ids is not None:
-            token_type_embeds = self.wte(token_type_ids)
+            # token_type_embeds = self.wte(token_type_ids)
+            token_type_embeds = torch.utils.checkpoint.checkpoint(self.wte, token_type_ids)
         else:
             token_type_embeds = 0
         hidden_states = inputs_embeds + position_embeds + token_type_embeds
@@ -477,10 +482,10 @@ class GPT2Model(GPT2PreTrainedModel):
         for i, (block, layer_past) in enumerate(zip(self.h, past)):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states.view(*output_shape),)
-
-            outputs = block(
-                hidden_states, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask[i]
-            )
+            # outputs = block(
+            #     hidden_states, layer_past=layer_past, attention_mask=attention_mask, head_mask=head_mask[i]
+            # )
+            outputs = torch.utils.checkpoint.checkpoint(block, hidden_states, layer_past, attention_mask, head_mask[i])
 
             hidden_states, present = outputs[:2]
             if self.output_past:
@@ -489,7 +494,8 @@ class GPT2Model(GPT2PreTrainedModel):
             if self.output_attentions:
                 all_attentions.append(outputs[2])
 
-        hidden_states = self.ln_f(hidden_states)
+        hidden_states = torch.utils.checkpoint.checkpoint(self.ln_f, hidden_states)
+        # hidden_states = self.ln_f(hidden_states)
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
